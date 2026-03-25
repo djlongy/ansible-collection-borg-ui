@@ -77,36 +77,12 @@ _raw:
   elements: str
 """
 
-import json
-import time
-import hmac
-import hashlib
-import base64
-
 from ansible.errors import AnsibleError
 from ansible.plugins.lookup import LookupBase
 from ansible.utils.display import Display
+from ansible_collections.borgui.borg_ui.plugins.module_utils.borg_ui_common import mint_jwt
 
 display = Display()
-
-
-def _mint_jwt(secret_key, username="admin"):
-    """Mint an HS256 JWT. Mirrors app/core/security.py::create_access_token."""
-
-    def _b64url(data):
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
-
-    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")))
-    exp = int(time.time()) + 86400  # 24-hour expiry
-    payload = _b64url(json.dumps({"sub": username, "exp": exp}, separators=(",", ":")))
-
-    signing_input = "{0}.{1}".format(header, payload).encode("utf-8")
-    secret = secret_key.encode("utf-8") if isinstance(secret_key, str) else secret_key
-    sig = hmac.new(secret, signing_input, hashlib.sha256).digest()
-
-    return "{0}.{1}.{2}".format(header, payload, _b64url(sig))
 
 
 class LookupModule(LookupBase):
@@ -124,7 +100,7 @@ class LookupModule(LookupBase):
         username = kwargs.get("username", "admin")
 
         try:
-            token = _mint_jwt(secret_key, username=username)
+            token = mint_jwt(secret_key, username=username)
         except Exception as exc:
             raise AnsibleError("borg_ui_jwt: failed to mint JWT: {0}".format(exc))
 

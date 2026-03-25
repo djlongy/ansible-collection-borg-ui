@@ -12,7 +12,6 @@ __metaclass__ = type
 
 import json
 import ssl
-import datetime
 
 try:
     from urllib.request import urlopen, Request
@@ -33,33 +32,10 @@ class BorgUIClientError(Exception):
         self.body = body
 
 
-def _mint_jwt(secret_key, username="admin"):
-    """Mint a short-lived JWT using the borg-ui SECRET_KEY (HS256).
-
-    Replicates the logic in app/core/security.py::create_access_token.
-    Uses only the stdlib — no PyJWT or python-jose required.
-    """
-    import hmac
-    import hashlib
-    import base64
-    import struct
-    import time
-
-    def _b64url(data):
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("utf-8")
-
-    header = _b64url(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")))
-    # 24-hour expiry — long enough for any playbook run
-    exp = int(time.time()) + 86400
-    payload = _b64url(json.dumps({"sub": username, "exp": exp}, separators=(",", ":")))
-
-    signing_input = "{0}.{1}".format(header, payload).encode("utf-8")
-    secret = secret_key.encode("utf-8") if isinstance(secret_key, str) else secret_key
-    sig = hmac.new(secret, signing_input, hashlib.sha256).digest()
-
-    return "{0}.{1}.{2}".format(header, payload, _b64url(sig))
+# Import mint_jwt from the shared common module (single source of truth).
+# A private alias is kept so existing test code referencing _mint_jwt continues to work.
+from .borg_ui_common import mint_jwt
+_mint_jwt = mint_jwt
 
 
 class BorgUIClient(object):
@@ -84,9 +60,11 @@ class BorgUIClient(object):
                  insecure=False, timeout=30):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        if not isinstance(self.timeout, (int, float)) or self.timeout <= 0:
+            self.timeout = 30  # sensible default
 
-        # Build SSL context
-        if insecure:
+        # Build SSL context — only meaningful for HTTPS URLs
+        if insecure and base_url.startswith("https"):
             self._ssl_ctx = ssl.create_default_context()
             self._ssl_ctx.check_hostname = False
             self._ssl_ctx.verify_mode = ssl.CERT_NONE
@@ -97,11 +75,20 @@ class BorgUIClient(object):
         if token:
             self._token = token
         elif secret_key:
-            self._token = _mint_jwt(secret_key, username)
+            self._token = mint_jwt(secret_key, username)
         elif secret_key_file:
-            with open(secret_key_file, "r") as fh:
-                key = fh.read().strip()
-            self._token = _mint_jwt(key, username)
+            try:
+                with open(secret_key_file, "r") as fh:
+                    key = fh.read().strip()
+                if not key:
+                    raise BorgUIClientError(
+                        "Secret key file is empty: {0}".format(secret_key_file)
+                    )
+            except OSError as exc:
+                raise BorgUIClientError(
+                    "Cannot read secret key file {0}: {1}".format(secret_key_file, exc)
+                )
+            self._token = mint_jwt(key, username)
         else:
             raise BorgUIClientError(
                 "One of token, secret_key, or secret_key_file must be provided"
@@ -134,6 +121,8 @@ class BorgUIClient(object):
         except HTTPError as exc:
             raw = exc.read()
             body_str = raw.decode("utf-8") if raw else ""
+            if len(body_str) > 500:
+                body_str = body_str[:500] + "... (truncated)"
             try:
                 body_obj = json.loads(body_str)
             except (ValueError, TypeError):
