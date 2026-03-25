@@ -104,6 +104,18 @@ options:
         devices) that restrict shell access.
     type: bool
     default: false
+  use_sudo:
+    description:
+      - C(false) — borg-ui runs backup commands as the SSH login user
+        (standard; sufficient when the user has read access to all
+        backup source directories).
+      - C(true) — borg-ui runs backup commands via C(sudo) on the remote
+        host. Required when backing up directories owned by other users
+        or system paths that the SSH user cannot read directly.
+      - Requires passwordless sudo for the SSH user on the remote host.
+    type: bool
+    default: false
+    version_added: "1.1.0"
   default_path:
     description:
       - Default filesystem path on the remote host. Used as the base path
@@ -161,6 +173,15 @@ EXAMPLES = r"""
     ssh_username: u123456
     port: 23
     use_sftp_mode: true
+    state: present
+
+- name: Enable sudo for backing up system directories
+  borgui.borg_ui.borg_ui_connection:
+    base_url: https://borgui.example.com
+    secret_key: "{{ borg_ui_secret_key }}"
+    host: db-01.example.com
+    ssh_username: ansible
+    use_sudo: true
     state: present
 
 - name: Remove a connection (fails if any repository still references it)
@@ -222,6 +243,7 @@ _MUTABLE_FIELDS = (
     "username",
     "port",
     "use_sftp_mode",
+    "use_sudo",
     "default_path",
     "ssh_path_prefix",
     "mount_point",
@@ -249,6 +271,7 @@ def _build_arg_spec():
         ssh_username=dict(type="str", required=True),
         port=dict(type="int", default=22),
         use_sftp_mode=dict(type="bool", default=False),
+        use_sudo=dict(type="bool", default=False),
         default_path=dict(type="str", default=""),
         ssh_path_prefix=dict(type="str", default=""),
         mount_point=dict(type="str", default=""),
@@ -288,6 +311,7 @@ def _build_payload(params):
         "username": params["ssh_username"],
         "port": params["port"],
         "use_sftp_mode": params["use_sftp_mode"],
+        "use_sudo": params["use_sudo"],
         "default_path": params["default_path"],
         "ssh_path_prefix": params["ssh_path_prefix"],
         "mount_point": params["mount_point"],

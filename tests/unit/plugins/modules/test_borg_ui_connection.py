@@ -71,6 +71,7 @@ CONN_FIXTURE = {
     "username": "ansible",
     "port": 22,
     "use_sftp_mode": False,
+    "use_sudo": False,
     "default_path": "/opt",
     "ssh_path_prefix": "",
     "mount_point": "",
@@ -159,6 +160,7 @@ def _conn_desired(overrides=None):
         "username": CONN_FIXTURE["username"],
         "port": CONN_FIXTURE["port"],
         "use_sftp_mode": CONN_FIXTURE["use_sftp_mode"],
+        "use_sudo": CONN_FIXTURE["use_sudo"],
         "default_path": CONN_FIXTURE["default_path"],
         "ssh_path_prefix": CONN_FIXTURE["ssh_path_prefix"],
         "mount_point": CONN_FIXTURE["mount_point"],
@@ -180,6 +182,48 @@ class TestNeedsUpdate:
     def test_detects_default_path_change(self):
         changed, _, _ = conn_mod._needs_update(CONN_FIXTURE, _conn_desired({"default_path": "/home"}))
         assert changed is True
+
+    def test_detects_sudo_change(self):
+        changed, _, _ = conn_mod._needs_update(CONN_FIXTURE, _conn_desired({"use_sudo": True}))
+        assert changed is True
+
+    def test_no_change_when_sudo_matches(self):
+        changed, _, _ = conn_mod._needs_update(CONN_FIXTURE, _conn_desired({"use_sudo": False}))
+        assert changed is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for _build_payload
+# ---------------------------------------------------------------------------
+
+class TestBuildPayload:
+    def test_includes_use_sudo(self):
+        params = {
+            "host": "db-01.example.com",
+            "ssh_username": "ansible",
+            "port": 22,
+            "use_sftp_mode": False,
+            "use_sudo": True,
+            "default_path": "/opt",
+            "ssh_path_prefix": "",
+            "mount_point": "",
+        }
+        payload = conn_mod._build_payload(params)
+        assert payload["use_sudo"] is True
+
+    def test_use_sudo_defaults_false(self):
+        params = {
+            "host": "web-01.example.com",
+            "ssh_username": "ansible",
+            "port": 22,
+            "use_sftp_mode": False,
+            "use_sudo": False,
+            "default_path": "/opt",
+            "ssh_path_prefix": "",
+            "mount_point": "",
+        }
+        payload = conn_mod._build_payload(params)
+        assert payload["use_sudo"] is False
 
 
 # ---------------------------------------------------------------------------
