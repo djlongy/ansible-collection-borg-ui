@@ -313,3 +313,374 @@ class TestGetReferencingSchedules:
         }
         result = repo_mod._get_referencing_schedules(client, repo_id=1)
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# MockModule for execution-path tests
+# ---------------------------------------------------------------------------
+
+class _ExitJson(Exception):
+    pass
+
+
+class _FailJson(Exception):
+    pass
+
+
+class MockModule:
+    def __init__(self, params, check_mode=False):
+        self.params = params
+        self.check_mode = check_mode
+        self._result = None
+        self._failed = False
+
+    def exit_json(self, **kwargs):
+        self._result = kwargs
+        raise _ExitJson()
+
+    def fail_json(self, **kwargs):
+        self._failed = True
+        self._result = kwargs
+        raise _FailJson()
+
+
+def _repo_params(overrides=None):
+    """Build a full module params dict for repository tests."""
+    p = {
+        "name": "vault-01",
+        "path": "/backups/vault-01",
+        "encryption": "repokey",
+        "compression": "auto,lz4",
+        "source_directories": ["/opt"],
+        "exclude_patterns": [],
+        "pre_backup_script": "",
+        "post_backup_script": "",
+        "hook_timeout": 300,
+        "pre_hook_timeout": 300,
+        "post_hook_timeout": 300,
+        "continue_on_hook_failure": False,
+        "mode": "full",
+        "bypass_lock": False,
+        "custom_flags": "",
+        "source_connection_id": None,
+        "passphrase": "secret",
+        "cascade": False,
+        "state": "present",
+    }
+    if overrides:
+        p.update(overrides)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Tests for _handle_present
+# ---------------------------------------------------------------------------
+
+class TestHandlePresent:
+    def test_creates_when_not_found(self):
+        """_handle_present creates repository when it does not exist."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": []}
+        client._post_response = {"repository": {"id": 5, "name": "vault-01", "path": "/backups/vault-01"}}
+        module = MockModule(params=_repo_params())
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_present(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        assert module._result["repository"]["id"] == 5
+        post_calls = [c for c in client.calls if c[0] == "POST"]
+        assert len(post_calls) == 1
+
+    def test_create_includes_passphrase(self):
+        """_handle_present includes passphrase in create payload."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": []}
+        client._post_response = {"repository": {"id": 5, "name": "vault-01"}}
+        module = MockModule(params=_repo_params({"passphrase": "my-secret"}))
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_present(module, client)
+
+        post_calls = [c for c in client.calls if c[0] == "POST"]
+        assert post_calls[0][2]["passphrase"] == "my-secret"
+
+    def test_no_change_when_identical(self):
+        """_handle_present reports no change when existing matches desired."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        module = MockModule(params=_repo_params())
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_present(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is False
+        assert module._result["repository"] == REPO_FIXTURE
+
+    def test_updates_when_different(self):
+        """_handle_present updates repository when existing differs from desired."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        updated = dict(REPO_FIXTURE, compression="zstd")
+        client._put_response = {"repository": updated}
+        module = MockModule(params=_repo_params({"compression": "zstd"}))
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_present(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        assert module._result["diff"]["before"]["compression"] == "auto,lz4"
+        assert module._result["diff"]["after"]["compression"] == "zstd"
+        put_calls = [c for c in client.calls if c[0] == "PUT"]
+        assert len(put_calls) == 1
+
+    def test_check_mode_create(self):
+        """In check mode, _handle_present reports would-create but makes no POST."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": []}
+        module = MockModule(params=_repo_params(), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_present(module, client)
+
+        assert module._result["changed"] is True
+        post_calls = [c for c in client.calls if c[0] == "POST"]
+        assert len(post_calls) == 0
+
+    def test_check_mode_update(self):
+        """In check mode, _handle_present reports would-update but makes no PUT."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        module = MockModule(params=_repo_params({"compression": "zstd"}), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_present(module, client)
+
+        assert module._result["changed"] is True
+        put_calls = [c for c in client.calls if c[0] == "PUT"]
+        assert len(put_calls) == 0
+
+    def test_check_mode_no_change(self):
+        """In check mode with no differences, reports changed=False."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        module = MockModule(params=_repo_params(), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_present(module, client)
+
+        assert module._result["changed"] is False
+
+    def test_fails_when_path_missing(self):
+        """_handle_present fails when path is not provided."""
+        client = MockClient()
+        module = MockModule(params=_repo_params({"path": None}))
+
+        with pytest.raises(_FailJson):
+            repo_mod._handle_present(module, client)
+
+        assert module._failed is True
+        assert "path" in module._result["msg"]
+
+    def test_create_handles_missing_api_response(self):
+        """_handle_present handles API not returning repository details on create."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": []}
+        client._post_response = {}  # No "repository" key
+        module = MockModule(params=_repo_params())
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_present(module, client)
+
+        assert module._result["changed"] is True
+        assert "_warning" in module._result["repository"]
+
+
+# ---------------------------------------------------------------------------
+# Tests for _handle_absent
+# ---------------------------------------------------------------------------
+
+class TestHandleAbsent:
+    def test_no_change_when_not_found(self):
+        """_handle_absent reports no change when repository does not exist."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": []}
+        module = MockModule(params=_repo_params({"state": "absent"}))
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_absent(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is False
+
+    def test_deletes_when_found_no_refs(self):
+        """_handle_absent deletes repository when it exists and has no schedule refs."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        client._get_responses["/api/schedule/"] = {"jobs": []}
+        module = MockModule(params=_repo_params({"state": "absent"}))
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_absent(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        delete_calls = [c for c in client.calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 1
+        assert "/api/repositories/1" in delete_calls[0][1]
+
+    def test_fails_when_refs_exist_no_cascade(self):
+        """_handle_absent fails when schedules reference repo and cascade=False."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        client._get_responses["/api/schedule/"] = {"jobs": [SCHEDULE_FIXTURE]}
+        module = MockModule(params=_repo_params({"state": "absent", "cascade": False}))
+
+        with pytest.raises(_FailJson):
+            repo_mod._handle_absent(module, client)
+
+        assert module._failed is True
+        assert "referenced by" in module._result["msg"]
+        assert "nightly" in module._result["msg"]
+
+    def test_cascade_deletes_schedules_and_repo(self):
+        """_handle_absent with cascade=True removes repo from schedules then deletes."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        client._get_responses["/api/schedule/"] = {
+            "jobs": [{"id": 10, "name": "nightly", "repository_ids": [1]}]
+        }
+        module = MockModule(params=_repo_params({"state": "absent", "cascade": True}))
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_absent(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        delete_calls = [c for c in client.calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 2
+
+    def test_cascade_updates_schedule_with_remaining_repos(self):
+        """_handle_absent with cascade=True updates schedule that has other repos."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        client._get_responses["/api/schedule/"] = {
+            "jobs": [{"id": 10, "name": "nightly", "repository_ids": [1, 2]}]
+        }
+        module = MockModule(params=_repo_params({"state": "absent", "cascade": True}))
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_absent(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        put_calls = [c for c in client.calls if c[0] == "PUT"]
+        assert len(put_calls) == 1
+        assert put_calls[0][2] == {"repository_ids": [2]}
+
+    def test_check_mode_no_delete(self):
+        """In check mode, _handle_absent reports would-delete but makes no API call."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        client._get_responses["/api/schedule/"] = {"jobs": []}
+        module = MockModule(params=_repo_params({"state": "absent"}), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_absent(module, client)
+
+        assert module._result["changed"] is True
+        delete_calls = [c for c in client.calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 0
+
+    def test_check_mode_not_found(self):
+        """In check mode, _handle_absent reports no change when not found."""
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": []}
+        module = MockModule(params=_repo_params({"state": "absent"}), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            repo_mod._handle_absent(module, client)
+
+        assert module._result["changed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for main() via monkeypatch
+# ---------------------------------------------------------------------------
+
+class TestMain:
+    def _patch_and_run(self, monkeypatch, params, check_mode, client):
+        mock_module = MockModule(params=params, check_mode=check_mode)
+        monkeypatch.setattr(repo_mod, "AnsibleModule", lambda **kw: mock_module)
+        monkeypatch.setattr(repo_mod, "make_client", lambda p: client)
+        return mock_module
+
+    def test_main_present_create(self, monkeypatch):
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": []}
+        client._post_response = {"repository": {"id": 5, "name": "vault-01"}}
+        params = _repo_params()
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            repo_mod.main()
+
+        assert module._result["changed"] is True
+
+    def test_main_present_no_change(self, monkeypatch):
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        params = _repo_params()
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            repo_mod.main()
+
+        assert module._result["changed"] is False
+
+    def test_main_absent_deletes(self, monkeypatch):
+        client = MockClient()
+        client._get_responses["/api/repositories/"] = {"repositories": [REPO_FIXTURE]}
+        client._get_responses["/api/schedule/"] = {"jobs": []}
+        params = _repo_params({"state": "absent"})
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            repo_mod.main()
+
+        assert module._result["changed"] is True
+
+    def test_main_client_error(self, monkeypatch):
+        params = _repo_params()
+        mock_module = MockModule(params=params, check_mode=False)
+        monkeypatch.setattr(repo_mod, "AnsibleModule", lambda **kw: mock_module)
+
+        def raise_error(p):
+            raise BorgUIClientError("connection refused")
+
+        monkeypatch.setattr(repo_mod, "make_client", raise_error)
+
+        with pytest.raises(_FailJson):
+            repo_mod.main()
+
+        assert mock_module._failed is True
+
+    def test_main_api_error(self, monkeypatch):
+        """main() catches BorgUIClientError from handle functions."""
+        client = MockClient()
+
+        def raise_error(path):
+            raise BorgUIClientError("server error")
+
+        client.get = raise_error
+        params = _repo_params()
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_FailJson):
+            repo_mod.main()
+
+        assert module._failed is True
+        assert "API error" in module._result["msg"]

@@ -206,3 +206,412 @@ class TestNeedsUpdate:
         assert sched_mod._needs_update(
             JOB_FIXTURE, _desired_from_fixture({"repository_ids": [2, 1]})
         ) is False
+
+
+# ---------------------------------------------------------------------------
+# MockModule for execution-path tests
+# ---------------------------------------------------------------------------
+
+class _ExitJson(Exception):
+    pass
+
+
+class _FailJson(Exception):
+    pass
+
+
+class MockModule:
+    def __init__(self, params, check_mode=False):
+        self.params = params
+        self.check_mode = check_mode
+        self._result = None
+        self._failed = False
+
+    def exit_json(self, **kwargs):
+        self._result = kwargs
+        raise _ExitJson()
+
+    def fail_json(self, **kwargs):
+        self._failed = True
+        self._result = kwargs
+        raise _FailJson()
+
+
+def _sched_params(overrides=None):
+    """Build a full module params dict for schedule tests."""
+    p = {
+        "base_url": "https://borgui.example.com",
+        "token": "test-token",
+        "secret_key": None,
+        "secret_key_file": None,
+        "username": "admin",
+        "insecure": False,
+        "name": "nightly-mgt",
+        "cron_expression": "0 2 * * *",
+        "enabled": True,
+        "description": "Nightly backup",
+        "repositories": ["vault-01", "gitlab-01"],
+        "run_prune_after": False,
+        "run_compact_after": False,
+        "prune_keep_hourly": 0,
+        "prune_keep_daily": 7,
+        "prune_keep_weekly": 4,
+        "prune_keep_monthly": 6,
+        "prune_keep_quarterly": 0,
+        "prune_keep_yearly": 1,
+        "state": "present",
+    }
+    if overrides:
+        p.update(overrides)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Tests for run_module — state=present (create/update/no-op/check-mode)
+# ---------------------------------------------------------------------------
+
+class TestRunModulePresent:
+    """Test the present state branch of run_module via internal functions."""
+
+    def _run_present(self, client, module):
+        """Simulate the present-state logic from run_module."""
+        params = module.params
+        name = params["name"]
+
+        existing = sched_mod._find_schedule_by_name(client, name)
+        repository_ids = sched_mod._resolve_repository_ids(client, params["repositories"])
+        desired_payload = sched_mod._build_payload(params, repository_ids)
+
+        if existing is None:
+            diff = sched_mod.diff_dicts({}, sched_mod._extract_managed(desired_payload))
+            if module.check_mode:
+                module.exit_json(changed=True, diff=diff, schedule=desired_payload)
+            resp = client.post("/api/schedule/", data=desired_payload)
+            module.exit_json(changed=True, diff=diff, schedule=resp.get("job", desired_payload))
+
+        if not sched_mod._needs_update(existing, desired_payload):
+            module.exit_json(changed=False, schedule=existing)
+
+        diff = sched_mod.diff_dicts(
+            sched_mod._extract_managed(existing),
+            sched_mod._extract_managed(desired_payload),
+        )
+        if module.check_mode:
+            module.exit_json(changed=True, diff=diff, schedule=desired_payload)
+
+        resp = client.put("/api/schedule/{0}".format(existing["id"]), data=desired_payload)
+        module.exit_json(changed=True, diff=diff, schedule=resp.get("job", desired_payload))
+
+    def test_creates_when_not_found(self):
+        """Creates schedule when it does not exist."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": []}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        client._post_resp = {"job": {"id": 20, "name": "nightly-mgt"}}
+        module = MockModule(params=_sched_params())
+
+        with pytest.raises(_ExitJson):
+            self._run_present(client, module)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        assert module._result["schedule"]["id"] == 20
+        post_calls = [c for c in client.calls if c[0] == "POST"]
+        assert len(post_calls) == 1
+
+    def test_no_change_when_identical(self):
+        """Reports no change when existing schedule matches desired."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        module = MockModule(params=_sched_params())
+
+        with pytest.raises(_ExitJson):
+            self._run_present(client, module)
+
+        assert module._result["changed"] is False
+        assert module._result["schedule"] == JOB_FIXTURE
+
+    def test_updates_when_different(self):
+        """Updates schedule when cron_expression differs."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        client._put_resp = {"job": dict(JOB_FIXTURE, cron_expression="0 3 * * *")}
+        module = MockModule(params=_sched_params({"cron_expression": "0 3 * * *"}))
+
+        with pytest.raises(_ExitJson):
+            self._run_present(client, module)
+
+        assert module._result["changed"] is True
+        put_calls = [c for c in client.calls if c[0] == "PUT"]
+        assert len(put_calls) == 1
+
+    def test_check_mode_create(self):
+        """In check mode, reports would-create but makes no POST."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": []}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        module = MockModule(params=_sched_params(), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            self._run_present(client, module)
+
+        assert module._result["changed"] is True
+        post_calls = [c for c in client.calls if c[0] == "POST"]
+        assert len(post_calls) == 0
+
+    def test_check_mode_update(self):
+        """In check mode, reports would-update but makes no PUT."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        module = MockModule(params=_sched_params({"cron_expression": "0 3 * * *"}), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            self._run_present(client, module)
+
+        assert module._result["changed"] is True
+        put_calls = [c for c in client.calls if c[0] == "PUT"]
+        assert len(put_calls) == 0
+
+    def test_check_mode_no_change(self):
+        """In check mode with no differences, reports changed=False."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        module = MockModule(params=_sched_params(), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            self._run_present(client, module)
+
+        assert module._result["changed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for run_module — state=absent
+# ---------------------------------------------------------------------------
+
+class TestRunModuleAbsent:
+    """Test the absent state branch of run_module via internal functions."""
+
+    def _run_absent(self, client, module):
+        """Simulate the absent-state logic from run_module."""
+        name = module.params["name"]
+        existing = sched_mod._find_schedule_by_name(client, name)
+
+        if existing is None:
+            module.exit_json(changed=False)
+
+        diff = sched_mod.diff_dicts(sched_mod._extract_managed(existing), {})
+
+        if not module.check_mode:
+            client.delete("/api/schedule/{0}".format(existing["id"]))
+
+        module.exit_json(changed=True, diff=diff)
+
+    def test_no_change_when_not_found(self):
+        """Reports no change when schedule does not exist."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": []}
+        module = MockModule(params=_sched_params({"state": "absent"}))
+
+        with pytest.raises(_ExitJson):
+            self._run_absent(client, module)
+
+        assert module._result["changed"] is False
+
+    def test_deletes_when_found(self):
+        """Deletes schedule when it exists."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        module = MockModule(params=_sched_params({"state": "absent"}))
+
+        with pytest.raises(_ExitJson):
+            self._run_absent(client, module)
+
+        assert module._result["changed"] is True
+        delete_calls = [c for c in client.calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 1
+        assert "/api/schedule/10" in delete_calls[0][1]
+
+    def test_check_mode_no_delete(self):
+        """In check mode, reports would-delete but makes no API call."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        module = MockModule(params=_sched_params({"state": "absent"}), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            self._run_absent(client, module)
+
+        assert module._result["changed"] is True
+        delete_calls = [c for c in client.calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 0
+
+    def test_check_mode_not_found(self):
+        """In check mode, reports no change when not found."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": []}
+        module = MockModule(params=_sched_params({"state": "absent"}), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            self._run_absent(client, module)
+
+        assert module._result["changed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for run_module() directly (covers lines 359-487)
+# ---------------------------------------------------------------------------
+
+class TestRunModuleDirect:
+    """Test run_module by monkeypatching AnsibleModule and make_client."""
+
+    def _patch_and_run(self, monkeypatch, params, check_mode, client):
+        """Patch AnsibleModule + make_client, call run_module, return the mock module."""
+        mock_module = MockModule(params=params, check_mode=check_mode)
+
+        def fake_ansible_module(**kwargs):
+            return mock_module
+
+        # Patch on the module's own reference to AnsibleModule
+        monkeypatch.setattr(sched_mod, "AnsibleModule", fake_ansible_module)
+        monkeypatch.setattr(sched_mod, "make_client", lambda p: client)
+        return mock_module
+
+    def test_run_module_present_create(self, monkeypatch):
+        """run_module creates schedule when not found."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": []}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        client._post_resp = {"job": {"id": 20, "name": "nightly-mgt"}}
+        params = _sched_params()
+
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            sched_mod.run_module()
+
+        assert module._result["changed"] is True
+
+    def test_run_module_present_no_change(self, monkeypatch):
+        """run_module reports no change when schedule matches."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        params = _sched_params()
+
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            sched_mod.run_module()
+
+        assert module._result["changed"] is False
+
+    def test_run_module_present_update(self, monkeypatch):
+        """run_module updates schedule when fields differ."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        client._put_resp = {"job": dict(JOB_FIXTURE, cron_expression="0 3 * * *")}
+        params = _sched_params({"cron_expression": "0 3 * * *"})
+
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            sched_mod.run_module()
+
+        assert module._result["changed"] is True
+
+    def test_run_module_present_check_mode_create(self, monkeypatch):
+        """run_module in check mode reports would-create."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": []}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        params = _sched_params()
+
+        module = self._patch_and_run(monkeypatch, params, True, client)
+
+        with pytest.raises(_ExitJson):
+            sched_mod.run_module()
+
+        assert module._result["changed"] is True
+        post_calls = [c for c in client.calls if c[0] == "POST"]
+        assert len(post_calls) == 0
+
+    def test_run_module_present_check_mode_update(self, monkeypatch):
+        """run_module in check mode reports would-update."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": REPOS}
+        params = _sched_params({"cron_expression": "0 3 * * *"})
+
+        module = self._patch_and_run(monkeypatch, params, True, client)
+
+        with pytest.raises(_ExitJson):
+            sched_mod.run_module()
+
+        assert module._result["changed"] is True
+
+    def test_run_module_absent_not_found(self, monkeypatch):
+        """run_module state=absent reports no change when not found."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": []}
+        params = _sched_params({"state": "absent"})
+
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            sched_mod.run_module()
+
+        assert module._result["changed"] is False
+
+    def test_run_module_absent_deletes(self, monkeypatch):
+        """run_module state=absent deletes schedule when found."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        params = _sched_params({"state": "absent"})
+
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            sched_mod.run_module()
+
+        assert module._result["changed"] is True
+        delete_calls = [c for c in client.calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 1
+
+    def test_run_module_absent_check_mode(self, monkeypatch):
+        """run_module state=absent in check mode reports would-delete."""
+        client = MockClient()
+        client._responses["/api/schedule/"] = {"jobs": [JOB_FIXTURE]}
+        params = _sched_params({"state": "absent"})
+
+        module = self._patch_and_run(monkeypatch, params, True, client)
+
+        with pytest.raises(_ExitJson):
+            sched_mod.run_module()
+
+        assert module._result["changed"] is True
+        delete_calls = [c for c in client.calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 0
+
+    def test_run_module_client_error(self, monkeypatch):
+        """run_module handles BorgUIClientError from API calls."""
+        params = _sched_params()
+        mock_module = MockModule(params=params, check_mode=False)
+
+        def fake_ansible_module(**kwargs):
+            return mock_module
+
+        monkeypatch.setattr(sched_mod, "AnsibleModule", fake_ansible_module)
+
+        def raise_error(p):
+            raise sched_mod.BorgUIClientError("connection refused")
+
+        monkeypatch.setattr(sched_mod, "make_client", raise_error)
+
+        with pytest.raises(_FailJson):
+            sched_mod.run_module()
+
+        assert mock_module._failed is True

@@ -245,3 +245,323 @@ class TestGetReferencingRepos:
         }
         result = conn_mod._get_referencing_repos(client, connection_id=1)
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# MockModule for execution-path tests
+# ---------------------------------------------------------------------------
+
+class _ExitJson(Exception):
+    pass
+
+
+class _FailJson(Exception):
+    pass
+
+
+class MockModule:
+    def __init__(self, params, check_mode=False):
+        self.params = params
+        self.check_mode = check_mode
+        self._result = None
+        self._failed = False
+
+    def exit_json(self, **kwargs):
+        self._result = kwargs
+        raise _ExitJson()
+
+    def fail_json(self, **kwargs):
+        self._failed = True
+        self._result = kwargs
+        raise _FailJson()
+
+
+def _conn_params(overrides=None):
+    """Build a full module params dict for connection tests."""
+    p = {
+        "host": "backup-server.example.com",
+        "ssh_username": "ansible",
+        "port": 22,
+        "use_sftp_mode": False,
+        "use_sudo": False,
+        "default_path": "/opt",
+        "ssh_path_prefix": "",
+        "mount_point": "",
+        "cascade": False,
+        "state": "present",
+    }
+    if overrides:
+        p.update(overrides)
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Tests for _handle_present
+# ---------------------------------------------------------------------------
+
+class TestHandlePresent:
+    def test_fails_when_connection_not_found(self):
+        """_handle_present fails when no matching connection exists."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": []}
+        module = MockModule(params=_conn_params())
+
+        with pytest.raises(_FailJson):
+            conn_mod._handle_present(module, client)
+
+        assert module._failed is True
+        assert "No SSH connection exists" in module._result["msg"]
+
+    def test_no_change_when_identical(self):
+        """_handle_present reports no change when existing matches desired."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        module = MockModule(params=_conn_params())
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_present(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is False
+        assert module._result["connection"] == CONN_FIXTURE
+
+    def test_updates_when_different(self):
+        """_handle_present updates connection when existing differs from desired."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        client._put_resp = {"connection": dict(CONN_FIXTURE, use_sftp_mode=True)}
+        module = MockModule(params=_conn_params({"use_sftp_mode": True}))
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_present(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        assert module._result["diff"]["before"]["use_sftp_mode"] is False
+        assert module._result["diff"]["after"]["use_sftp_mode"] is True
+        put_calls = [c for c in client.calls if c[0] == "PUT"]
+        assert len(put_calls) == 1
+        assert "/api/ssh-keys/connections/1" in put_calls[0][1]
+
+    def test_check_mode_no_mutation(self):
+        """In check mode, _handle_present reports would-change but makes no PUT."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        module = MockModule(params=_conn_params({"use_sftp_mode": True}), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_present(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        put_calls = [c for c in client.calls if c[0] == "PUT"]
+        assert len(put_calls) == 0
+
+    def test_check_mode_no_change(self):
+        """In check mode with no differences, reports changed=False."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        module = MockModule(params=_conn_params(), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_present(module, client)
+
+        assert module._result["changed"] is False
+
+    def test_update_sudo_field(self):
+        """_handle_present detects and updates use_sudo change."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        client._put_resp = {"connection": dict(CONN_FIXTURE, use_sudo=True)}
+        module = MockModule(params=_conn_params({"use_sudo": True}))
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_present(module, client)
+
+        assert module._result["changed"] is True
+        assert module._result["diff"]["after"]["use_sudo"] is True
+
+
+# ---------------------------------------------------------------------------
+# Tests for _handle_absent
+# ---------------------------------------------------------------------------
+
+class TestHandleAbsent:
+    def test_no_change_when_not_found(self):
+        """_handle_absent reports no change when connection does not exist."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": []}
+        module = MockModule(params=_conn_params({"state": "absent"}))
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_absent(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is False
+        assert module._result["connection"] is None
+
+    def test_deletes_when_found_no_refs(self):
+        """_handle_absent deletes connection when it exists and has no references."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": []}
+        module = MockModule(params=_conn_params({"state": "absent"}))
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_absent(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        assert module._result["connection"] is None
+        delete_calls = [c for c in client.calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 1
+
+    def test_fails_when_refs_exist_no_cascade(self):
+        """_handle_absent fails when repos reference connection and cascade=False."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": REPOS_FIXTURE}
+        module = MockModule(params=_conn_params({"state": "absent", "cascade": False}))
+
+        with pytest.raises(_FailJson):
+            conn_mod._handle_absent(module, client)
+
+        assert module._failed is True
+        assert "referenced by" in module._result["msg"]
+        assert "vault-01" in module._result["msg"]
+
+    def test_deletes_when_refs_exist_cascade_true(self):
+        """_handle_absent deletes connection when cascade=True even with references."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": REPOS_FIXTURE}
+        module = MockModule(params=_conn_params({"state": "absent", "cascade": True}))
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_absent(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        delete_calls = [c for c in client.calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 1
+
+    def test_check_mode_no_delete(self):
+        """In check mode, _handle_absent reports would-delete but makes no API call."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": []}
+        module = MockModule(params=_conn_params({"state": "absent"}), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_absent(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        delete_calls = [c for c in client.calls if c[0] == "DELETE"]
+        assert len(delete_calls) == 0
+
+    def test_check_mode_not_found(self):
+        """In check mode, _handle_absent reports no change when not found."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": []}
+        module = MockModule(params=_conn_params({"state": "absent"}), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_absent(module, client)
+
+        assert module._result["changed"] is False
+
+
+# ---------------------------------------------------------------------------
+# Tests for main() via monkeypatch
+# ---------------------------------------------------------------------------
+
+class TestMain:
+    def _patch_and_run(self, monkeypatch, params, check_mode, client):
+        mock_module = MockModule(params=params, check_mode=check_mode)
+        monkeypatch.setattr(conn_mod, "AnsibleModule", lambda **kw: mock_module)
+        monkeypatch.setattr(conn_mod, "_make_client", lambda p: client)
+        return mock_module
+
+    def test_main_present_no_change(self, monkeypatch):
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        params = _conn_params()
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            conn_mod.main()
+
+        assert module._result["changed"] is False
+
+    def test_main_present_update(self, monkeypatch):
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        client._put_resp = {"connection": dict(CONN_FIXTURE, use_sftp_mode=True)}
+        params = _conn_params({"use_sftp_mode": True})
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            conn_mod.main()
+
+        assert module._result["changed"] is True
+
+    def test_main_absent_deletes(self, monkeypatch):
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": [CONN_FIXTURE]}
+        client._responses["/api/repositories/"] = {"repositories": []}
+        params = _conn_params({"state": "absent"})
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_ExitJson):
+            conn_mod.main()
+
+        assert module._result["changed"] is True
+
+    def test_main_client_error(self, monkeypatch):
+        params = _conn_params()
+        mock_module = MockModule(params=params, check_mode=False)
+        monkeypatch.setattr(conn_mod, "AnsibleModule", lambda **kw: mock_module)
+        monkeypatch.setattr(conn_mod, "_make_client", lambda p: (_ for _ in ()).throw(
+            conn_mod.BorgUIClientError("connection refused")
+        ))
+
+        with pytest.raises(_FailJson):
+            conn_mod.main()
+
+        assert mock_module._failed is True
+
+    def test_main_api_error(self, monkeypatch):
+        """main() catches BorgUIClientError from handle functions."""
+        client = MockClient()
+        # Force an error during _find_connection
+        def raise_error(path):
+            raise conn_mod.BorgUIClientError("server error")
+        client.get = raise_error
+
+        params = _conn_params()
+        module = self._patch_and_run(monkeypatch, params, False, client)
+
+        with pytest.raises(_FailJson):
+            conn_mod.main()
+
+        assert module._failed is True
+        assert "API error" in module._result["msg"]
+
+
+# ---------------------------------------------------------------------------
+# Tests for _build_arg_spec and _make_client
+# ---------------------------------------------------------------------------
+
+class TestBuildArgSpec:
+    def test_returns_dict_with_expected_keys(self):
+        spec = conn_mod._build_arg_spec()
+        assert "host" in spec
+        assert "ssh_username" in spec
+        assert "api_username" in spec
+        assert "port" in spec
+        assert "use_sftp_mode" in spec
+        assert "use_sudo" in spec
+        assert "cascade" in spec
+        # Ensure 'username' was renamed to 'api_username'
+        assert "username" not in spec
