@@ -256,3 +256,94 @@ class TestBorgUIClientRequests:
         monkeypatch.setattr(client_mod, "urlopen", lambda req, **kw: _EmptyResp())
         result = client.get("/api/empty")
         assert result is None
+
+    @pytest.mark.parametrize("status_code", [400, 401, 403, 500])
+    def test_http_error_codes_raise_borguiclienterror(self, client, monkeypatch, status_code):
+        import urllib.error
+        import io
+        body = json.dumps({"detail": "error"}).encode("utf-8")
+        monkeypatch.setattr(
+            client_mod, "urlopen",
+            lambda req, **kw: (_ for _ in ()).throw(
+                urllib.error.HTTPError(
+                    "http://x", status_code, "Error", {}, io.BytesIO(body)
+                )
+            )
+        )
+        with pytest.raises(BorgUIClientError) as exc_info:
+            client.get("/api/something")
+        assert exc_info.value.status_code == status_code
+
+    def test_http_error_with_empty_body_does_not_crash(self, client, monkeypatch):
+        import urllib.error
+        import io
+        monkeypatch.setattr(
+            client_mod, "urlopen",
+            lambda req, **kw: (_ for _ in ()).throw(
+                urllib.error.HTTPError("http://x", 500, "Internal Server Error", {}, io.BytesIO(b""))
+            )
+        )
+        with pytest.raises(BorgUIClientError) as exc_info:
+            client.get("/api/something")
+        assert exc_info.value.status_code == 500
+
+    def test_long_error_body_is_truncated(self, client, monkeypatch):
+        import urllib.error
+        import io
+        long_body = ("x" * 600).encode("utf-8")
+        monkeypatch.setattr(
+            client_mod, "urlopen",
+            lambda req, **kw: (_ for _ in ()).throw(
+                urllib.error.HTTPError("http://x", 400, "Bad Request", {}, io.BytesIO(long_body))
+            )
+        )
+        with pytest.raises(BorgUIClientError) as exc_info:
+            client.get("/api/something")
+        assert "truncated" in str(exc_info.value)
+        # The message must not contain the full 600-char body
+        assert len(str(exc_info.value)) < 600
+
+    def test_secret_key_file_not_found_raises_borguiclienterror(self):
+        with pytest.raises(BorgUIClientError, match="Cannot read secret key file"):
+            BorgUIClient(
+                base_url="http://localhost:8081",
+                secret_key_file="/nonexistent/path/key.txt",
+            )
+
+    def test_secret_key_file_empty_raises_borguiclienterror(self, tmp_path):
+        key_file = tmp_path / "empty_key.txt"
+        key_file.write_text("   \n")  # whitespace only — strips to empty
+        with pytest.raises(BorgUIClientError, match="empty"):
+            BorgUIClient(
+                base_url="http://localhost:8081",
+                secret_key_file=str(key_file),
+            )
+
+    def test_jwt_exp_claim_is_approximately_now_plus_86400(self):
+        import base64
+        import time
+        c = BorgUIClient(base_url="http://localhost:8081", secret_key="testsecret")
+        payload_b64 = c._token.split(".")[1]
+        padded = payload_b64 + "=" * (4 - len(payload_b64) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded))
+        now = int(time.time())
+        assert abs(payload["exp"] - now - 86400) <= 2
+
+    @pytest.mark.parametrize("timeout,expected", [
+        (None, 30),
+        (0, 30),
+        (-5, 30),
+        (60, 60),
+        (1, 1),
+    ])
+    def test_timeout_defaults_and_passthrough(self, timeout, expected):
+        kwargs = {"base_url": "http://localhost:8081", "token": "t"}
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        c = BorgUIClient(**kwargs)
+        assert c.timeout == expected
+
+    def test_insecure_with_http_url_does_not_create_ssl_ctx(self):
+        # insecure=True but URL is http:// — no SSL context should be created
+        c = BorgUIClient(base_url="http://localhost:8081", token="t", insecure=True)
+        assert c._ssl_ctx is None
