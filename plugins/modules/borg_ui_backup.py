@@ -301,6 +301,8 @@ def _poll_until_complete(module, client, job_id, timeout, interval):
             )
 
         last_resp = client.get("/api/backup/status/{0}".format(job_id))
+        if not last_resp:
+            last_resp = {"status": "unknown"}
         status = last_resp.get("status", "unknown")
 
         if status == "completed":
@@ -340,6 +342,8 @@ def _handle_start(module, client):
 
     resp = client.post("/api/backup/start", data={"repository": repo_path})
     job_id = resp.get("job_id")
+    if not job_id:
+        module.fail_json(msg="API did not return a job_id for the backup request")
     status = resp.get("status", "pending")
     message = resp.get("message", "Backup job started")
 

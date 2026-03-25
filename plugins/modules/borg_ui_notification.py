@@ -322,14 +322,21 @@ def _make_client_params(params):
 
 
 def _find_notification_by_name(client, name):
-    """Fetch all notification channels and return the one matching *name*, or None."""
+    """Fetch all notification channels and return the one matching *name*, or None.
+
+    The API may return:
+    - a list directly: [{...}, ...]
+    - a dict with a ``notifications`` key: {"notifications": [{...}, ...]}
+    """
     notifications = client.get("/api/notifications")
     if isinstance(notifications, list):
         items = notifications
+    elif isinstance(notifications, dict):
+        items = notifications.get("notifications", [])
+        if not isinstance(items, list):
+            items = []
     else:
-        items = notifications.get("notifications", notifications)
-        if isinstance(items, dict):
-            items = [items]
+        items = []
     for notif in items:
         if notif.get("name") == name:
             return notif
@@ -389,7 +396,11 @@ def _handle_present(module, client):
             )
 
         resp = client.post("/api/notifications", data=desired)
-        notification = resp if resp else desired
+        if not resp or "notification" not in resp:
+            notification = desired.copy()
+            notification["_warning"] = "API did not return notification details"
+        else:
+            notification = resp["notification"]
         module.exit_json(
             changed=True,
             diff={"before": {}, "after": desired},
@@ -413,7 +424,11 @@ def _handle_present(module, client):
             "/api/notifications/{0}".format(existing["id"]),
             data=desired,
         )
-        notification = resp if resp else existing
+        if not resp or "notification" not in resp:
+            notification = desired.copy()
+            notification["_warning"] = "API did not return notification details"
+        else:
+            notification = resp["notification"]
         module.exit_json(
             changed=True,
             diff={"before": diff_before, "after": diff_after},

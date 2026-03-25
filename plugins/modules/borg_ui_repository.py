@@ -591,11 +591,15 @@ def _handle_present(module, client):
             )
 
         resp = client.post("/api/repositories/", data=create_payload)
-        repo = resp.get("repository", desired)
+        if not resp or "repository" not in resp:
+            result = desired.copy()
+            result["_warning"] = "API did not return repository details"
+        else:
+            result = resp["repository"]
         module.exit_json(
             changed=True,
             diff={"before": {}, "after": desired},
-            repository=repo,
+            repository=result,
         )
     else:
         # Update if needed
@@ -615,11 +619,15 @@ def _handle_present(module, client):
             "/api/repositories/{0}".format(existing["id"]),
             data=desired,
         )
-        repo = resp.get("repository", existing)
+        if not resp or "repository" not in resp:
+            result = desired.copy()
+            result["_warning"] = "API did not return repository details"
+        else:
+            result = resp["repository"]
         module.exit_json(
             changed=True,
             diff={"before": diff_before, "after": diff_after},
-            repository=repo,
+            repository=result,
         )
 
 
