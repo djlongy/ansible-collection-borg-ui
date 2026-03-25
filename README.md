@@ -18,11 +18,12 @@ No extra Python packages required — the collection uses `urllib.request` only.
 ## Installation
 
 ```bash
-# From the repo root:
-ansible-galaxy collection install ansible/
-# or build then install:
-ansible-galaxy collection build ansible/
-ansible-galaxy collection install borgui-borg_ui-1.0.0.tar.gz
+# From Git:
+ansible-galaxy collection install git+https://github.com/djlongy/ansible-collection-borg-ui.git
+
+# Or build locally:
+ansible-galaxy collection build .
+ansible-galaxy collection install borgui-borg_ui-*.tar.gz
 ```
 
 ## Authentication
@@ -45,7 +46,7 @@ The `secret_key` approach is recommended for automation — store the key in a s
 |--------|-------------|
 | `borgui.borg_ui.borg_ui_repository` | Manage backup repositories |
 | `borgui.borg_ui.borg_ui_schedule` | Manage scheduled backup jobs |
-| `borgui.borg_ui.borg_ui_connection` | Update or delete SSH connections |
+| `borgui.borg_ui.borg_ui_connection` | Create, update, or delete SSH connections |
 | `borgui.borg_ui.borg_ui_notification` | Manage Apprise notification channels |
 | `borgui.borg_ui.borg_ui_backup` | Trigger / monitor on-demand backup runs |
 
@@ -55,7 +56,7 @@ The `secret_key` approach is recommended for automation — store the key in a s
 |--------|-------------|
 | `borgui.borg_ui.borg_ui_jwt` | Mint a short-lived JWT from the borg-ui `SECRET_KEY` |
 
-The lookup is useful when calling the borg-ui API directly with `ansible.builtin.uri` (e.g. SSH key setup via `POST /api/ssh-keys/quick-setup`):
+The lookup is useful when calling the borg-ui API directly with `ansible.builtin.uri`:
 
 ```yaml
 headers:
@@ -84,8 +85,9 @@ borg_ui_servers:
 
   - name: db-primary
     host: 192.168.1.61
-    ssh_user: root
+    ssh_user: ansible
     ssh_port: 22
+    use_sudo: true          # backup via sudo (for system directories)
     source_dirs:
       - /var/lib/pgsql
       - /etc/postgresql
@@ -149,6 +151,34 @@ For a step-by-step walkthrough of the full setup from scratch, see [`docs/QUICKS
     state: present
 ```
 
+### Managing SSH connections
+
+The `borg_ui_connection` module can create, update, and delete SSH connections. New connections are created using the borg-ui system SSH key — the key's public half must already be in `authorized_keys` on the target host.
+
+```yaml
+# Add a server with sudo enabled (system key must be deployed first)
+- borgui.borg_ui.borg_ui_connection:
+    base_url: https://borgui.example.com
+    secret_key: "{{ borgui_secret_key }}"
+    host: db-01.example.com
+    ssh_username: ansible
+    port: 22
+    use_sudo: true           # run borg commands via sudo
+    use_sftp_mode: true      # use SFTP for file access
+    state: present
+
+# Remove a server (fails if repos still reference it, unless cascade: true)
+- borgui.borg_ui.borg_ui_connection:
+    base_url: https://borgui.example.com
+    secret_key: "{{ borgui_secret_key }}"
+    host: old-server.example.com
+    ssh_username: ansible
+    state: absent
+    cascade: true
+```
+
+The `use_sudo` option (added in borg-ui v1.77.0) tells borg-ui to run backup commands via `sudo` on the remote host. This is required when backing up directories the SSH user cannot read directly (e.g. `/var/lib/ipa/backup`, system logs). The SSH user must have passwordless sudo configured.
+
 ## Per-server field reference
 
 | Field | Type | Default | Description |
@@ -159,6 +189,7 @@ For a step-by-step walkthrough of the full setup from scratch, see [`docs/QUICKS
 | `ssh_user` | string | `ansible` | SSH login user on the remote host |
 | `ssh_port` | int | `22` | SSH port on the remote host |
 | `use_sftp_mode` | bool | `false` | `true` for Hetzner Storage Boxes / shell-restricted SSH |
+| `use_sudo` | bool | `false` | `true` to run backup commands via sudo on the remote host (requires passwordless sudo) |
 | `exclude` | list | `[]` | Extra glob patterns, appended to the global defaults |
 | `encryption` | string | `repokey` | `repokey`, `repokey-blake2`, `keyfile`, `keyfile-blake2`, `authenticated`, `none` |
 | `compression` | string | `auto,lz4` | `none`, `lz4`, `zstd`, `zstd,N`, `zlib`, `zlib,N` |
@@ -169,7 +200,6 @@ For a step-by-step walkthrough of the full setup from scratch, see [`docs/QUICKS
 ## Running Tests
 
 ```bash
-cd ansible/
 pip install pytest pytest-mock
 pytest tests/unit/ -v
 ```
