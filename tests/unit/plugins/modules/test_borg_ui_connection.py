@@ -90,10 +90,15 @@ class MockClient:
         self.calls = []
         self._responses = {}
         self._put_resp = None
+        self._post_resp = None
 
     def get(self, path):
         self.calls.append(("GET", path))
         return self._responses.get(path)
+
+    def post(self, path, data=None):
+        self.calls.append(("POST", path, data))
+        return self._post_resp
 
     def put(self, path, data=None):
         self.calls.append(("PUT", path, data))
@@ -296,21 +301,130 @@ def _conn_params(overrides=None):
 
 
 # ---------------------------------------------------------------------------
+# Tests for _get_system_key_id
+# ---------------------------------------------------------------------------
+
+class TestGetSystemKeyId:
+    def test_returns_key_id_when_exists(self):
+        client = MockClient()
+        client._responses["/api/ssh-keys/system-key"] = {
+            "exists": True, "ssh_key": {"id": 7, "name": "system-key"}
+        }
+        assert conn_mod._get_system_key_id(client) == 7
+
+    def test_returns_none_when_no_system_key(self):
+        client = MockClient()
+        client._responses["/api/ssh-keys/system-key"] = {"exists": False}
+        assert conn_mod._get_system_key_id(client) is None
+
+    def test_returns_none_when_response_empty(self):
+        client = MockClient()
+        client._responses["/api/ssh-keys/system-key"] = None
+        assert conn_mod._get_system_key_id(client) is None
+
+
+# ---------------------------------------------------------------------------
 # Tests for _handle_present
 # ---------------------------------------------------------------------------
 
 class TestHandlePresent:
-    def test_fails_when_connection_not_found(self):
-        """_handle_present fails when no matching connection exists."""
+    def test_fails_when_no_system_key(self):
+        """_handle_present fails when connection not found and no system key exists."""
         client = MockClient()
         client._responses["/api/ssh-keys/connections"] = {"connections": []}
+        client._responses["/api/ssh-keys/system-key"] = {"exists": False}
         module = MockModule(params=_conn_params())
 
         with pytest.raises(_FailJson):
             conn_mod._handle_present(module, client)
 
         assert module._failed is True
-        assert "No SSH connection exists" in module._result["msg"]
+        assert "No system SSH key" in module._result["msg"]
+
+    def test_creates_connection_when_not_found(self):
+        """_handle_present creates connection via system key when not found."""
+        client = MockClient()
+        # First call: connection not found; after creation: connection found
+        get_call_count = {"n": 0}
+        orig_get = client.get
+
+        def get_with_state(path):
+            if path == "/api/ssh-keys/connections":
+                get_call_count["n"] += 1
+                if get_call_count["n"] == 1:
+                    return {"connections": []}
+                return {"connections": [CONN_FIXTURE]}
+            return orig_get(path)
+
+        client.get = get_with_state
+        client._responses["/api/ssh-keys/system-key"] = {
+            "exists": True, "ssh_key": {"id": 5}
+        }
+        module = MockModule(params=_conn_params())
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_present(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        assert module._result["connection"]["id"] == 1
+        # Verify POST was called to test-connection
+        post_calls = [c for c in client.calls if c[0] == "POST"]
+        assert len(post_calls) == 1
+        assert "/api/ssh-keys/5/test-connection" in post_calls[0][1]
+
+    def test_creates_and_updates_additional_fields(self):
+        """_handle_present creates then updates when extra fields differ from defaults."""
+        client = MockClient()
+        # Connection returned after creation has use_sudo=False (default)
+        created_conn = dict(CONN_FIXTURE, use_sudo=False)
+        get_call_count = {"n": 0}
+
+        def get_with_state(path):
+            if path == "/api/ssh-keys/connections":
+                get_call_count["n"] += 1
+                if get_call_count["n"] == 1:
+                    return {"connections": []}
+                # After creation, return connection with defaults
+                return {"connections": [created_conn]}
+            if path == "/api/ssh-keys/system-key":
+                return {"exists": True, "ssh_key": {"id": 5}}
+            return None
+
+        client.get = get_with_state
+        client._put_resp = {"connection": dict(CONN_FIXTURE, use_sudo=True)}
+        module = MockModule(params=_conn_params({"use_sudo": True}))
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_present(module, client)
+
+        assert module._result["changed"] is True
+        # Verify both POST (create) and PUT (update) were called
+        post_calls = [c for c in client.calls if c[0] == "POST"]
+        put_calls = [c for c in client.calls if c[0] == "PUT"]
+        assert len(post_calls) == 1
+        assert len(put_calls) == 1
+
+    def test_create_check_mode(self):
+        """In check mode, _handle_present reports would-create without API calls."""
+        client = MockClient()
+        client._responses["/api/ssh-keys/connections"] = {"connections": []}
+        client._responses["/api/ssh-keys/system-key"] = {
+            "exists": True, "ssh_key": {"id": 5}
+        }
+        module = MockModule(params=_conn_params(), check_mode=True)
+
+        with pytest.raises(_ExitJson):
+            conn_mod._handle_present(module, client)
+
+        assert module._failed is False
+        assert module._result["changed"] is True
+        assert module._result["diff"]["before"] == {}
+        # No POST or PUT should have been made
+        post_calls = [c for c in client.calls if c[0] == "POST"]
+        put_calls = [c for c in client.calls if c[0] == "PUT"]
+        assert len(post_calls) == 0
+        assert len(put_calls) == 0
 
     def test_no_change_when_identical(self):
         """_handle_present reports no change when existing matches desired."""

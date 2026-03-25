@@ -13,15 +13,14 @@ module: borg_ui_connection
 short_description: Manage borg-ui SSH connections
 version_added: "1.0.0"
 description:
-  - Update or delete existing SSH connections in a borg-ui instance via the
+  - Create, update, or delete SSH connections in a borg-ui instance via the
     REST API.
   - An B(SSH connection) in borg-ui represents the credentials and settings
     needed to reach a remote source host via SSH. borg-ui uses it to mount
     source directories before running C(borg create).
-  - B(This module cannot create SSH connections.) Connections are created
-    through the borg-ui web UI (C(SSH Keys > Quick Setup)) or the
-    C(POST /api/ssh-keys/quick-setup) endpoint. Once created, this module can
-    update their settings or delete them.
+  - New connections are created using the borg-ui system SSH key. The system
+    key's public key must already be deployed to the target host (e.g. via
+    an Ansible baseline role). borg-ui tests the connection during creation.
   - The identity key is the combination of I(host) + I(ssh_username) + I(port).
     All three must match an existing connection exactly.
   - Supports C(--check) (dry-run) and C(--diff) mode.
@@ -65,9 +64,9 @@ options:
     default: false
   state:
     description:
-      - C(present) — update the connection settings if any mutable field has
-        changed. Fails if the connection does not already exist (this module
-        cannot create connections).
+      - C(present) — ensure the connection exists with the desired settings.
+        Creates it using the system SSH key if it does not exist, or updates
+        mutable fields if it does.
       - C(absent) — delete the connection. Fails if any repository references
         it unless I(cascade=true).
     type: str
@@ -154,6 +153,16 @@ seealso:
 EXAMPLES = r"""
 # The identity key is host + ssh_username + port — all three must match
 # an existing connection in borg-ui exactly.
+
+- name: Add a new server to borg-ui (system key must be authorized on the target)
+  borgui.borg_ui.borg_ui_connection:
+    base_url: https://borgui.example.com
+    secret_key: "{{ borg_ui_secret_key }}"
+    host: web-01.example.com
+    ssh_username: ansible
+    port: 22
+    use_sudo: true
+    state: present
 
 - name: Update default path on an existing SSH connection
   borgui.borg_ui.borg_ui_connection:
@@ -342,6 +351,14 @@ def _get_referencing_repos(client, connection_id):
     return [r for r in repos if r.get("source_ssh_connection_id") == connection_id]
 
 
+def _get_system_key_id(client):
+    """Get the borg-ui system SSH key ID, required for creating connections."""
+    resp = client.get("/api/ssh-keys/system-key")
+    if not resp or not resp.get("exists") or not resp.get("ssh_key"):
+        return None
+    return resp["ssh_key"].get("id")
+
+
 def _handle_present(module, client):
     """Ensure the connection exists with the desired configuration."""
     params = module.params
@@ -352,13 +369,53 @@ def _handle_present(module, client):
     existing = _find_connection(client, host, ssh_username, port)
 
     if existing is None:
-        module.fail_json(
-            msg=(
-                "No SSH connection exists for {0}@{1}:{2}. "
-                "Create it in the borg-ui UI (SSH Keys -> Quick Setup) first, "
-                "then use this module to manage its attributes."
-            ).format(ssh_username, host, port)
+        # Connection not found — create it
+        system_key_id = _get_system_key_id(client)
+        if system_key_id is None:
+            module.fail_json(
+                msg="No system SSH key found in borg-ui. "
+                    "Generate one first via the web UI."
+            )
+
+        desired = _build_payload(params)
+
+        if module.check_mode:
+            module.exit_json(
+                changed=True,
+                connection=desired,
+                diff={"before": {}, "after": desired},
+            )
+
+        # Create connection via test-connection endpoint
+        client.post(
+            "/api/ssh-keys/{0}/test-connection".format(system_key_id),
+            {"host": host, "username": ssh_username, "port": port},
         )
+
+        # Re-fetch to get the connection ID
+        created = _find_connection(client, host, ssh_username, port)
+        if created is None:
+            module.fail_json(
+                msg="Connection was created but could not be found afterwards."
+            )
+
+        # Check if any mutable fields differ from defaults and need updating
+        changed_fields, _, _ = _needs_update(created, desired)
+        if changed_fields:
+            client.put(
+                "/api/ssh-keys/connections/{0}".format(created["id"]),
+                data=desired,
+            )
+            created = (
+                _find_connection(client, host, ssh_username, port) or created
+            )
+
+        module.exit_json(
+            changed=True,
+            connection=created,
+            diff={"before": {}, "after": desired},
+        )
+        return
 
     desired = _build_payload(params)
     changed, diff_before, diff_after = _needs_update(existing, desired)
