@@ -285,6 +285,29 @@ class TestNeedsUpdate:
 # Tests for cascade delete logic (_get_schedules_using_repo)
 # ---------------------------------------------------------------------------
 
+class TestSourceConnectionIdFromApiShape:
+    def test_connection_read_from_source_ssh_connection_id(self):
+        existing = dict(REPO_FIXTURE)
+        existing.pop("source_connection_id", None)
+        existing["source_ssh_connection_id"] = 61
+        changed, _, _ = repo_mod._needs_update(existing, _desired_params({"source_connection_id": 61}))
+        assert changed is False
+
+    def test_connection_read_from_source_locations(self):
+        existing = dict(REPO_FIXTURE)
+        existing.pop("source_connection_id", None)
+        existing["source_locations"] = [{"source_type": "remote", "source_ssh_connection_id": 61}]
+        changed, _, _ = repo_mod._needs_update(existing, _desired_params({"source_connection_id": 61}))
+        assert changed is False
+
+    def test_a_different_connection_is_still_a_change(self):
+        existing = dict(REPO_FIXTURE)
+        existing.pop("source_connection_id", None)
+        existing["source_ssh_connection_id"] = 7
+        changed, before, after = repo_mod._needs_update(existing, _desired_params({"source_connection_id": 61}))
+        assert changed is True and before == {"source_connection_id": 7} and after == {"source_connection_id": 61}
+
+
 class TestGetReferencingSchedules:
     def test_finds_schedules_referencing_repo(self):
         client = MockClient()
