@@ -518,6 +518,26 @@ def _build_payload(params):
     return payload
 
 
+def _existing_value(existing, key):
+    """Read a field from the API's repository, which does not echo every
+    request field under its request name.
+
+    borg-ui returns the SSH source as ``source_ssh_connection_id`` (and inside
+    ``source_locations``), never as ``source_connection_id``. Reading the
+    request name gave None, so a repository with an SSH source looked changed on
+    every run.
+    """
+    if key in existing:
+        return existing[key]
+    if key == "source_connection_id":
+        if existing.get("source_ssh_connection_id") is not None:
+            return existing["source_ssh_connection_id"]
+        for location in existing.get("source_locations") or []:
+            if location.get("source_ssh_connection_id") is not None:
+                return location["source_ssh_connection_id"]
+    return None
+
+
 def _needs_update(existing, desired):
     """Compare existing repo state with desired state, ignoring server-managed fields.
 
@@ -529,7 +549,7 @@ def _needs_update(existing, desired):
     for key, desired_val in desired.items():
         if key in _IGNORE_FIELDS:
             continue
-        existing_val = existing.get(key)
+        existing_val = _existing_value(existing, key)
         if existing_val != desired_val:
             before[key] = existing_val
             after[key] = desired_val
